@@ -229,6 +229,25 @@ class KVCacheResult(tp.NamedTuple):
         return KVCacheResult(keys, values, positions)
 
 
+def _streaming_device(module: nn.Module, device: torch.device) -> torch.device:
+    """Device for streaming state of `module`, given the device of its weights.
+
+    With accelerate CPU offload the weights of an offloaded module are `meta`
+    placeholders and the real device is the execution device of its hook; state
+    allocated on `meta` cannot be used in the forward pass.
+    """
+    if device.type != "meta":
+        return device
+    hooks = [getattr(module, "_hf_hook", None)]
+    while hooks:
+        hook = hooks.pop(0)
+        execution_device = getattr(hook, "execution_device", None)
+        if execution_device is not None and not isinstance(execution_device, dict):
+            return torch.device(execution_device)
+        hooks.extend(getattr(hook, "hooks", None) or [])  # accelerate SequentialHook
+    return device
+
+
 class RingKVCache:
     """Efficient streaming KVCache to be compatible with Cuda Graph.
 
@@ -377,7 +396,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 )
         else:
             capacity = self.context
-        device = self.in_proj_weight.device
+        device = _streaming_device(self, self.in_proj_weight.device)
         # TODO: the following estimation will not work great with FSDP.
         dtype = self.in_proj_weight.dtype
         dim_per_head = self.embed_dim // self.num_heads
@@ -692,7 +711,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             )
 
     def _init_streaming_state(self, batch_size: int) -> _TransformerState:
-        device = next(self.parameters()).device
+        device = _streaming_device(self, next(self.parameters()).device)
         return _TransformerState(offset=torch.zeros(1, device=device, dtype=torch.long))
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
